@@ -63,6 +63,21 @@ object Mono {
         ).apply { setMargins(0, gap, 0, gap) }
     }
 
+    /** Tab look: the selected tab is filled with the accent color. */
+    fun tab(b: Button, density: Float, selected: Boolean) {
+        val accent = accent(b.context)
+        val radius = 8f * density
+        val s = strokeWidth(density)
+        if (selected) {
+            b.background = shape(accent, accent, radius, s)
+            b.setTextColor(if (accent == WHITE) BLACK else WHITE)
+        } else {
+            b.background = shape(BUTTON_FILL, accent, radius, s)
+            b.setTextColor(WHITE)
+        }
+        b.isAllCaps = false
+    }
+
     fun edit(e: EditText) {
         e.setTextColor(WHITE)
         e.setHintTextColor(GRAY)
