@@ -96,6 +96,47 @@ object Adb {
         null
     }
 
+    /** The port Wireless Debugging is listening on, if the system will tell us. */
+    private fun tlsPort(): Int? = try {
+        val p = Runtime.getRuntime().exec(arrayOf("getprop", "service.adb.tls.port"))
+        p.inputStream.bufferedReader().readText().trim().toIntOrNull()?.takeIf { it > 0 }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * Finds Wireless Debugging by itself (no IP or port to type) and connects.
+     * You still have to pair once with the pairing code.
+     * force = true drops the current connection first (use it after Wi-Fi has been toggled).
+     */
+    fun autoConnect(ctx: Context, force: Boolean = false): String {
+        val m = AdbManager.get(ctx)
+        if (force) {
+            try { (m as? java.io.Closeable)?.close() } catch (_: Throwable) {}
+        }
+        if (m.isConnected) return "Connected (already)."
+        try { m.autoConnect(ctx, 10_000L) } catch (_: Throwable) {}
+        if (m.isConnected) return "Connected (found automatically)."
+        val port = tlsPort()
+        if (port != null) {
+            for (host in listOfNotNull(wifiIp(), "127.0.0.1")) {
+                try { if (m.connect(host, port)) return "Connected to $host:$port." } catch (_: Throwable) {}
+            }
+        }
+        return "Couldn't connect automatically. Turn on Wireless Debugging (and pair once), or type the IP and port by hand."
+    }
+
+    /** The highest refresh rate this headset says it supports, or null if it can't be read. */
+    fun maxRefreshRate(ctx: Context): Int? {
+        val out = shell(ctx, "dumpsys display | grep -o 'fps=[0-9.]*'")
+        return Regex("""fps=([0-9]+(?:\.[0-9]+)?)""").findAll(out)
+            .mapNotNull { it.groupValues[1].toDoubleOrNull() }
+            .map { Math.round(it).toInt() }
+            .filter { it in 30..240 }
+            .toList()
+            .maxOrNull()
+    }
+
     fun isConnected(ctx: Context): Boolean = AdbManager.get(ctx).isConnected
 
     fun shell(ctx: Context, command: String): String {
