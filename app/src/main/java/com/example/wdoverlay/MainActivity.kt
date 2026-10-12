@@ -67,6 +67,14 @@ class MainActivity : Activity() {
             if (r == "Not connected.") r else message
         }) { show(it) }
 
+        // Runs slow work (like searching for Wireless Debugging) without blocking the other buttons.
+        fun background(block: () -> String) {
+            Thread {
+                val message = block()
+                runOnUiThread { show(message) }
+            }.also { it.isDaemon = true; it.start() }
+        }
+
         val title = TextView(this).apply { text = "BBBlabs"; textSize = 28f; setTextColor(Mono.WHITE) }
         status = TextView(this).apply { textSize = 18f; setTextColor(Mono.WHITE) }
         output = TextView(this).apply {
@@ -95,6 +103,11 @@ class MainActivity : Activity() {
         root.addView(colorRow)
 
         // ---- Connect ----
+        root.addView(label("Quick connect (after you have paired once)"))
+        root.addView(button("Auto connect (no IP or port needed)") {
+            show("Looking for Wireless Debugging...")
+            background { Adb.autoConnect(this) }
+        })
         root.addView(label("1. Turn on Wireless Debugging, then tap \"Pair device with pairing code\"."))
         root.addView(button("Open Developer Options") {
             startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
@@ -140,8 +153,16 @@ class MainActivity : Activity() {
             side(confirmButton("200 Hz (FPS)") {
                 setCmd("setprop debug.oculus.refreshRate 200", "Requested 200. If the screen looks wrong, tap Reset to normal.")
             }),
-            side(confirmButton("Max") {
-                setCmd("setprop debug.oculus.refreshRate 1000", "Requested 1000. The screen's real limit is far lower, so this is likely ignored. Tap Reset to normal if anything looks wrong.")
+            side(button("Max") {
+                Adb.run({
+                    if (!Adb.isConnected(this)) "Not connected." else {
+                        val found = Adb.maxRefreshRate(this)
+                        val rate = found ?: 120
+                        Adb.shell(this, "setprop debug.oculus.refreshRate $rate")
+                        if (found != null) "Max: set to $rate Hz, the highest this headset reports."
+                        else "Couldn't read this headset's supported rates, so I tried $rate Hz."
+                    }
+                }) { show(it) }
             })
         ))
 
@@ -161,6 +182,31 @@ class MainActivity : Activity() {
                 "setprop debug.oculus.guardian_pause 0; setprop debug.oculus.refreshRate 90",
                 "Reset: boundary on, 90 Hz."
             )
+        })
+
+        // ---- Wi-Fi reset ----
+        // Runs detached on the headset so it keeps going after the connection drops.
+        val wifiScript = "nohup sh -c 'svc wifi disable; sleep 5; svc wifi enable; sleep 12; settings put global adb_wifi_enabled 1' >/dev/null 2>&1 &"
+        root.addView(label("Wi-Fi reset"))
+        root.addView(confirmButton("Wi-Fi off for 5 seconds, then back on") {
+            Adb.run({
+                if (!Adb.isConnected(this)) "Not connected." else {
+                    Adb.shell(this, wifiScript)
+                    "Wi-Fi is going off for 5 seconds. Reconnecting by itself afterwards..."
+                }
+            }) { show(it) }
+            // Keep trying to reconnect for about two minutes.
+            Thread {
+                repeat(12) {
+                    Thread.sleep(10_000L)
+                    val message = Adb.autoConnect(this, true)
+                    if (message.startsWith("Connected")) {
+                        runOnUiThread { show("Wi-Fi is back. $message") }
+                        return@Thread
+                    }
+                }
+                runOnUiThread { show("Couldn't reconnect on its own. Turn Wireless Debugging back on, then tap Auto connect.") }
+            }.also { it.isDaemon = true; it.start() }
         })
 
         // ---- Metrics HUD (uses Meta's OVR Metrics Tool, which must be installed) ----
@@ -206,6 +252,9 @@ class MainActivity : Activity() {
             addView(output, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         setContentView(outer)
+
+        // Try to connect right away if Wireless Debugging is already on and paired.
+        background { Adb.autoConnect(this) }
     }
 
     override fun onResume() { super.onResume(); refreshStatus() }
