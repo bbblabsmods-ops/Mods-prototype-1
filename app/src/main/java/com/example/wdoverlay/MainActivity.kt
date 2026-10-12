@@ -163,7 +163,35 @@ class MainActivity : Activity() {
             )
         })
 
-        root.addView(label("6. Run your own command"))
+        // ---- Metrics HUD (uses Meta's OVR Metrics Tool, which must be installed) ----
+        val omms = "am broadcast -n com.oculus.ovrmonitormetricsservice/.SettingsBroadcastReceiver -a com.oculus.ovrmonitormetricsservice"
+        fun hud(vararg parts: String) = parts.joinToString("; ") { "$omms.$it" }
+        val hudNote = "Sent. If the HUD doesn't appear, open OVR Metrics Tool once, turn on Enable Persistent Overlay, and restart the headset."
+
+        root.addView(label("6. Metrics HUD (battery, FPS, refresh rate, battery temp, screen tears)"))
+        root.addView(button("Show HUD at the top") {
+            setCmd(
+                hud(
+                    "DISABLE_STATS",
+                    "DISABLE_GRAPH",
+                    "ENABLE_STAT --es stat battery_level_percentage",
+                    "ENABLE_STAT --es stat average_frame_rate",
+                    "ENABLE_STAT --es stat display_refresh_rate",
+                    "ENABLE_STAT --es stat battery_temperature_celcius",
+                    "ENABLE_STAT --es stat screen_tear_count",
+                    "ENABLE_OVERLAY --eb headlocked true --ef pitch 20.0"
+                ),
+                hudNote
+            )
+        })
+        root.addView(row(
+            side(button("HUD up") { setCmd(hud("ENABLE_OVERLAY --eb headlocked true --ef pitch 20.0"), hudNote) }),
+            side(button("HUD center") { setCmd(hud("ENABLE_OVERLAY --eb headlocked true --ef pitch 0.0"), hudNote) }),
+            side(button("Hide HUD") { setCmd(hud("DISABLE_OVERLAY"), "HUD hidden.") })
+        ))
+        root.addView(button("Open OVR Metrics Tool") { showCmd("am start omms://app") })
+
+        root.addView(label("7. Run your own command"))
         root.addView(cmd)
         root.addView(button("Run") {
             val c = cmd.text.toString().trim()
