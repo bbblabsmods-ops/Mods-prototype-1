@@ -13,6 +13,7 @@ class MainActivity : Activity() {
 
     private lateinit var status: TextView
     private lateinit var output: TextView
+    private lateinit var outputScroll: ScrollView
 
     // The keep-alive reports reconnects here.
     private val messageListener: (String) -> Unit = { msg -> runOnUiThread { show(msg) } }
@@ -80,6 +81,14 @@ class MainActivity : Activity() {
                 runOnUiThread { show(message) }
             }.also { it.isDaemon = true; it.start() }
         }
+        // Runs one of the library commands and shows what it printed.
+        fun runCmd(command: String) = Adb.run({
+            val r = Adb.shell(this, command)
+            if (r == "(no output)") "Done." else r
+        }) { show(it) }
+        fun commandButton(c: ShellCmd): Button =
+            if (c.confirm) confirmButton(c.label) { runCmd(c.command) } else button(c.label) { runCmd(c.command) }
+
         // Splits "192.168.1.5:37123" into address and port; a plain number is just a port.
         fun splitHostPort(raw: String): Pair<String?, Int?> {
             val t = raw.trim()
@@ -96,6 +105,7 @@ class MainActivity : Activity() {
         val pairCode = inputBox("Pairing code", numbersOnly = true)
         val debugPort = inputBox("Wireless debugging port (or ip:port)")
         val cmd = inputBox("Shell command (e.g. getprop ro.product.model)")
+        val pkgField = inputBox("Package name, e.g. com.oculus.browser")
 
         fun host(): String = ipField.text.toString().trim().ifEmpty { "127.0.0.1" }
 
@@ -103,8 +113,12 @@ class MainActivity : Activity() {
         val title = TextView(this).apply { text = "BBBlabs"; textSize = 28f; setTextColor(Mono.WHITE) }
         status = TextView(this).apply { textSize = 16f; setTextColor(Mono.WHITE) }
         output = TextView(this).apply {
-            setTextIsSelectable(true); setTextColor(Mono.WHITE); setBackgroundColor(0xCC000000.toInt())
+            setTextIsSelectable(true); setTextColor(Mono.WHITE)
             setPadding(pad, pad / 2, pad, pad / 2); text = "Ready."
+        }
+        outputScroll = ScrollView(this).apply {
+            setBackgroundColor(0xCC000000.toInt())
+            addView(output)
         }
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -118,7 +132,7 @@ class MainActivity : Activity() {
         }
 
         // ---------- tabs ----------
-        val tabNames = listOf("Connect", "Display", "Tools", "HUD", "Theme")
+        val tabNames = listOf("Connect", "Display", "Tools", "Commands", "HUD", "Theme")
         val pages = tabNames.map { page() }
         val tabButtons = tabNames.map { name -> Button(this).apply { text = name; textSize = 13f } }
         fun selectTab(i: Int) {
@@ -127,20 +141,26 @@ class MainActivity : Activity() {
             prefs.edit().putInt("tab", i).apply()
         }
         tabButtons.forEachIndexed { index, b ->
-            b.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(2, 0, 2, 0) }
+            b.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { setMargins(2, 0, 2, 0) }
+            b.setPadding((14 * d).toInt(), 0, (14 * d).toInt(), 0)
             b.setOnClickListener { selectTab(index) }
         }
-        val tabBar = LinearLayout(this).apply {
+        val tabRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(pad / 2, 0, pad / 2, pad / 4)
             tabButtons.forEach { addView(it) }
+        }
+        val tabBar = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setPadding(pad / 2, 0, pad / 2, pad / 4)
+            addView(tabRow)
         }
 
         val connectPage = pages[0]
         val displayPage = pages[1]
         val toolsPage = pages[2]
-        val hudPage = pages[3]
-        val themePage = pages[4]
+        val commandsPage = pages[3]
+        val hudPage = pages[4]
+        val themePage = pages[5]
 
         // ---------- Connect page ----------
         connectPage.addView(label("Step 1: Turn on Wireless Debugging, tap \"Pair device with pairing code\", and leave that window open."))
@@ -247,6 +267,37 @@ class MainActivity : Activity() {
             if (c.isNotEmpty()) showCmd(c)
         })
 
+        // ---------- Commands page ----------
+        commandsPage.addView(label("Tap a command to run it. The result shows in the box at the bottom."))
+        Commands.groups.forEach { (groupName, items) ->
+            commandsPage.addView(label(groupName))
+            items.chunked(2).forEach { pair ->
+                val views = ArrayList<View>()
+                pair.forEach { c -> views.add(side(commandButton(c))) }
+                if (pair.size == 1) views.add(side(View(this)))
+                commandsPage.addView(row(*views.toTypedArray()))
+            }
+        }
+        // Commands that need an app's package name.
+        fun withPackage(build: (String) -> String) {
+            val pkg = pkgField.text.toString().trim()
+            if (!Regex("[A-Za-z0-9_.]+").matches(pkg)) {
+                show("Type a package name first (letters, numbers and dots only).")
+            } else {
+                runCmd(build(pkg))
+            }
+        }
+        commandsPage.addView(label("App tools (type a package name)"))
+        commandsPage.addView(pkgField)
+        commandsPage.addView(row(
+            side(button("App info") { withPackage { "dumpsys package $it | head -n 60" } }),
+            side(button("Launch") { withPackage { "monkey -p $it -c android.intent.category.LAUNCHER 1" } })
+        ))
+        commandsPage.addView(row(
+            side(button("Force stop") { withPackage { "am force-stop $it" } }),
+            side(confirmButton("Uninstall") { withPackage { "pm uninstall $it" } })
+        ))
+
         // ---------- HUD page (uses Meta's OVR Metrics Tool, which must be installed) ----------
         val omms = "am broadcast -n com.oculus.ovrmonitormetricsservice/.SettingsBroadcastReceiver -a com.oculus.ovrmonitormetricsservice"
         fun hud(vararg parts: String) = parts.joinToString("; ") { "$omms.$it" }
@@ -301,7 +352,7 @@ class MainActivity : Activity() {
             addView(header)
             addView(tabBar)
             addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-            addView(output, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(outputScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (150 * d).toInt()))
         }
         setContentView(outer)
         selectTab(prefs.getInt("tab", 0).coerceIn(0, tabNames.size - 1))
@@ -319,7 +370,11 @@ class MainActivity : Activity() {
 
     override fun onResume() { super.onResume(); refreshStatus() }
 
-    private fun show(text: String) { output.text = text; refreshStatus() }
+    private fun show(text: String) {
+        output.text = if (text.length > 6000) text.take(6000) + "\n... (cut off; run a narrower command to see the rest)" else text
+        outputScroll.scrollTo(0, 0)
+        refreshStatus()
+    }
 
     private fun refreshStatus() {
         Adb.run({ if (Adb.isConnected(this)) "ADB: connected" else "ADB: not connected" }) { status.text = it }
