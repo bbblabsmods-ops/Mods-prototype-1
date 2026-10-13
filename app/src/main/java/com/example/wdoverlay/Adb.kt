@@ -333,6 +333,22 @@ object Adb {
             .maxOrNull()
     }
 
+    /** The highest CPU level this headset model offers (Quest 2 and Pro: 6, Quest 3 and 3S: 5). */
+    fun maxCpuLevel(ctx: Context): Int {
+        val model = shell(ctx, "getprop ro.product.model")
+        return if (model.contains("Quest 2", true) || model.contains("Quest Pro", true)) 6 else 5
+    }
+
+    /** A reason not to max things out right now (low battery or too hot), or null if it's fine. */
+    fun maxOutBlocker(ctx: Context): String? {
+        val out = shell(ctx, "dumpsys battery | grep -E 'level|temperature'")
+        val level = Regex("""level:\s*(\d+)""").find(out)?.groupValues?.get(1)?.toIntOrNull()
+        val tenths = Regex("""temperature:\s*(\d+)""").find(out)?.groupValues?.get(1)?.toIntOrNull()
+        if (level != null && level < 15) return "The battery is at $level%. Plug the headset in first."
+        if (tenths != null && tenths >= 460) return "The battery is at ${tenths / 10} degrees C. Let it cool down first."
+        return null
+    }
+
     /** Checks the connection every 10 seconds and reconnects by itself if it dropped. */
     fun startWatchdog(ctx: Context) {
         if (watchdogStarted) return
