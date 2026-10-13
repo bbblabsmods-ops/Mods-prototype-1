@@ -224,6 +224,56 @@ class MainActivity : Activity() {
                 }) { show(it) }
             })
         ))
+
+        // ---- Performance: Meta's own CPU/GPU level and foveation overrides ----
+        val resetPerformance = "setprop debug.oculus.cpuLevel -1; setprop debug.oculus.gpuLevel -1; setprop debug.oculus.foveation.level \"\""
+        fun maxEverything() = Adb.run({
+            if (!Adb.isConnected(this)) "Not connected." else {
+                val blocker = Adb.maxOutBlocker(this)
+                if (blocker != null) blocker else {
+                    val hz = Adb.maxRefreshRate(this) ?: 120
+                    val cpu = Adb.maxCpuLevel(this)
+                    val r = Adb.shell(
+                        this,
+                        "setprop debug.oculus.refreshRate $hz; setprop debug.oculus.cpuLevel $cpu; setprop debug.oculus.gpuLevel 5; setprop debug.oculus.foveation.level 0"
+                    )
+                    if (r.startsWith("Error") || r.startsWith("Connection lost")) r
+                    else "Max everything: $hz Hz, CPU level $cpu, GPU level 5, foveation off. Expect more heat and faster battery drain. Tap Reset performance to go back."
+                }
+            }
+        }) { show(it) }
+
+        displayPage.addView(label("Performance (more heat, faster battery drain)"))
+        displayPage.addView(confirmButton("Max everything") { maxEverything() })
+        displayPage.addView(row(
+            side(button("CPU: max") {
+                Adb.run({
+                    if (!Adb.isConnected(this)) "Not connected." else {
+                        val cpu = Adb.maxCpuLevel(this)
+                        Adb.shell(this, "setprop debug.oculus.cpuLevel $cpu")
+                        "CPU level set to $cpu, the highest for this headset. It can still slow down if it gets hot."
+                    }
+                }) { show(it) }
+            }),
+            side(button("GPU: max") {
+                setCmd("setprop debug.oculus.gpuLevel 5", "GPU level set to 5, the highest. It can still slow down if the headset gets hot.")
+            })
+        ))
+        displayPage.addView(row(
+            side(button("Foveation: off") {
+                setCmd("setprop debug.oculus.foveation.level 0", "Foveated rendering turned off for apps that use it: sharper edges, more GPU work.")
+            }),
+            side(button("Show levels") {
+                showCmd("echo -n 'CPU level: '; getprop debug.oculus.cpuLevel; echo -n 'GPU level: '; getprop debug.oculus.gpuLevel; echo -n 'Foveation: '; getprop debug.oculus.foveation.level; echo -n 'Refresh rate: '; getprop debug.oculus.refreshRate")
+            })
+        ))
+        displayPage.addView(row(
+            side(confirmButton("240 Hz") {
+                setCmd("setprop debug.oculus.refreshRate 240", "Requested 240. The screen can't go that high, so the headset will most likely ignore it. Tap Reset to normal if anything looks wrong.")
+            }),
+            side(button("Reset performance") { setCmd(resetPerformance, "Performance back to default.") })
+        ))
+
         displayPage.addView(label("Boundary"))
         displayPage.addView(row(
             side(confirmButton("Delete boundary") {
@@ -236,8 +286,8 @@ class MainActivity : Activity() {
         displayPage.addView(label("If anything looks wrong"))
         displayPage.addView(button("Reset to normal (boundary on, 90 Hz)") {
             setCmd(
-                "setprop debug.oculus.guardian_pause 0; setprop debug.oculus.refreshRate 90",
-                "Reset: boundary on, 90 Hz."
+                "setprop debug.oculus.guardian_pause 0; setprop debug.oculus.refreshRate 90; " + resetPerformance,
+                "Reset: boundary on, 90 Hz, performance back to default."
             )
         })
         // Runs detached on the headset so it keeps going after the connection drops.
