@@ -57,6 +57,9 @@ object Mono {
             )
         )
         b.isAllCaps = false
+        // taller buttons are easier to hit with a controller
+        b.minHeight = (52 * density).toInt()
+        b.minimumHeight = (52 * density).toInt()
         val gap = (3 * density).toInt()
         b.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
@@ -76,6 +79,8 @@ object Mono {
             b.setTextColor(WHITE)
         }
         b.isAllCaps = false
+        b.minHeight = (44 * density).toInt()
+        b.minimumHeight = (44 * density).toInt()
     }
 
     fun edit(e: EditText) {
