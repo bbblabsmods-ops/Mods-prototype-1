@@ -1,10 +1,12 @@
 package com.example.wdoverlay
 
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.provider.Settings
 import android.text.InputType
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
@@ -26,6 +28,7 @@ class MainActivity : Activity() {
         val d = resources.displayMetrics.density
         val pad = (16 * d).toInt()
         val gap = (3 * d).toInt()
+        val slop = (36 * d).toInt()
         val prefs = getSharedPreferences("wd", MODE_PRIVATE)
 
         // ---------- small helpers ----------
@@ -40,15 +43,16 @@ class MainActivity : Activity() {
         fun button(t: String, onClick: () -> Unit) = Button(this).apply {
             text = t; setOnClickListener { onClick() }; Mono.button(this, d)
         }
-        // Two-tap confirm: the first tap arms the button, a second tap within 3 seconds runs it.
+        // Risky buttons ask for a second tap (you can turn that off on the Theme tab).
         fun confirmButton(name: String, onConfirm: () -> Unit) = Button(this).apply {
             text = name; Mono.button(this, d)
             var armed = false
             setOnClickListener {
-                if (!armed) {
+                if (prefs.getBoolean("confirm", true) && !armed) {
                     armed = true
                     text = "Tap again to confirm"
-                    postDelayed({ armed = false; text = name }, 3000)
+                    show("Tap the button again within 5 seconds to run: $name")
+                    postDelayed({ armed = false; text = name }, 5000)
                 } else {
                     armed = false
                     text = name
@@ -67,28 +71,32 @@ class MainActivity : Activity() {
         }
         fun page() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
 
+        // Shows "Working..." the moment you tap, then the result when it is ready.
+        fun runAndShow(block: () -> String) {
+            show("Working...")
+            Adb.run(block) { show(it) }
+        }
         // Runs a command and shows what it printed.
-        fun showCmd(command: String) = Adb.run({ Adb.shell(this, command) }) { show(it) }
-        // Runs a command and shows a short message (or the error if ADB isn't connected).
-        fun setCmd(command: String, message: String) = Adb.run({
+        fun showCmd(command: String) = runAndShow { Adb.shell(this, command) }
+        // Runs a command and shows a short message (or the error if it didn't work).
+        fun setCmd(command: String, message: String) = runAndShow {
             val r = Adb.shell(this, command)
-            if (r == "Not connected." || r.startsWith("Error") || r.startsWith("Connection lost")) r else message
-        }) { show(it) }
-        // Runs slow work (like searching for Wireless Debugging) without blocking the other buttons.
+            if (Adb.failed(r)) r else message
+        }
+        // Runs one of the library commands and shows what it printed.
+        fun runCmd(command: String) = runAndShow {
+            val r = Adb.shell(this, command)
+            if (r == "(no output)") "Done." else r
+        }
+        fun commandButton(c: ShellCmd): Button =
+            if (c.confirm) confirmButton(c.label) { runCmd(c.command) } else button(c.label) { runCmd(c.command) }
+        // Runs slow work (like searching for Wireless Debugging) on its own thread.
         fun inBackground(block: () -> String) {
             Thread {
                 val message = block()
                 runOnUiThread { show(message) }
             }.also { it.isDaemon = true; it.start() }
         }
-        // Runs one of the library commands and shows what it printed.
-        fun runCmd(command: String) = Adb.run({
-            val r = Adb.shell(this, command)
-            if (r == "(no output)") "Done." else r
-        }) { show(it) }
-        fun commandButton(c: ShellCmd): Button =
-            if (c.confirm) confirmButton(c.label) { runCmd(c.command) } else button(c.label) { runCmd(c.command) }
-
         // Splits "192.168.1.5:37123" into address and port; a plain number is just a port.
         fun splitHostPort(raw: String): Pair<String?, Int?> {
             val t = raw.trim()
@@ -116,7 +124,7 @@ class MainActivity : Activity() {
             setTextIsSelectable(true); setTextColor(Mono.WHITE)
             setPadding(pad, pad / 2, pad, pad / 2); text = "Ready."
         }
-        outputScroll = ScrollView(this).apply {
+        outputScroll = SteadyScrollView(this, slop).apply {
             setBackgroundColor(0xCC000000.toInt())
             addView(output)
         }
@@ -149,7 +157,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             tabButtons.forEach { addView(it) }
         }
-        val tabBar = HorizontalScrollView(this).apply {
+        val tabBar = SteadyHScrollView(this, slop).apply {
             isHorizontalScrollBarEnabled = false
             setPadding(pad / 2, 0, pad / 2, pad / 4)
             addView(tabRow)
@@ -213,22 +221,23 @@ class MainActivity : Activity() {
                 setCmd("setprop debug.oculus.refreshRate 200", "Requested 200. If the screen looks wrong, tap Reset to normal.")
             }),
             side(button("Max") {
-                Adb.run({
-                    if (!Adb.isConnected(this)) "Not connected." else {
+                runAndShow {
+                    if (!Adb.isConnected(this)) "Not connected. Tap Auto connect at the top." else {
                         val found = Adb.maxRefreshRate(this)
                         val rate = found ?: 120
-                        Adb.shell(this, "setprop debug.oculus.refreshRate $rate")
-                        if (found != null) "Max: set to $rate Hz, the highest this headset reports."
+                        val r = Adb.shell(this, "setprop debug.oculus.refreshRate $rate")
+                        if (Adb.failed(r)) r
+                        else if (found != null) "Max: set to $rate Hz, the highest this headset reports."
                         else "Couldn't read this headset's supported rates, so I tried $rate Hz."
                     }
-                }) { show(it) }
+                }
             })
         ))
 
         // ---- Performance: Meta's own CPU/GPU level and foveation overrides ----
         val resetPerformance = "setprop debug.oculus.cpuLevel -1; setprop debug.oculus.gpuLevel -1; setprop debug.oculus.foveation.level \"\""
-        fun maxEverything() = Adb.run({
-            if (!Adb.isConnected(this)) "Not connected." else {
+        fun maxEverything() = runAndShow {
+            if (!Adb.isConnected(this)) "Not connected. Tap Auto connect at the top." else {
                 val blocker = Adb.maxOutBlocker(this)
                 if (blocker != null) blocker else {
                     val hz = Adb.maxRefreshRate(this) ?: 120
@@ -237,23 +246,24 @@ class MainActivity : Activity() {
                         this,
                         "setprop debug.oculus.refreshRate $hz; setprop debug.oculus.cpuLevel $cpu; setprop debug.oculus.gpuLevel 5; setprop debug.oculus.foveation.level 0"
                     )
-                    if (r.startsWith("Error") || r.startsWith("Connection lost")) r
+                    if (Adb.failed(r)) r
                     else "Max everything: $hz Hz, CPU level $cpu, GPU level 5, foveation off. Expect more heat and faster battery drain. Tap Reset performance to go back."
                 }
             }
-        }) { show(it) }
+        }
 
         displayPage.addView(label("Performance (more heat, faster battery drain)"))
         displayPage.addView(confirmButton("Max everything") { maxEverything() })
         displayPage.addView(row(
             side(button("CPU: max") {
-                Adb.run({
-                    if (!Adb.isConnected(this)) "Not connected." else {
+                runAndShow {
+                    if (!Adb.isConnected(this)) "Not connected. Tap Auto connect at the top." else {
                         val cpu = Adb.maxCpuLevel(this)
-                        Adb.shell(this, "setprop debug.oculus.cpuLevel $cpu")
-                        "CPU level set to $cpu, the highest for this headset. It can still slow down if it gets hot."
+                        val r = Adb.shell(this, "setprop debug.oculus.cpuLevel $cpu")
+                        if (Adb.failed(r)) r
+                        else "CPU level set to $cpu, the highest for this headset. It can still slow down if it gets hot."
                     }
-                }) { show(it) }
+                }
             }),
             side(button("GPU: max") {
                 setCmd("setprop debug.oculus.gpuLevel 5", "GPU level set to 5, the highest. It can still slow down if the headset gets hot.")
@@ -294,13 +304,14 @@ class MainActivity : Activity() {
         val wifiScript = "nohup sh -c 'svc wifi disable; sleep 5; svc wifi enable; sleep 12; settings put global adb_wifi_enabled 1' >/dev/null 2>&1 &"
         displayPage.addView(label("Wi-Fi"))
         displayPage.addView(confirmButton("Wi-Fi off for 5 seconds, then back on") {
-            Adb.run({
-                if (!Adb.isConnected(this)) "Not connected." else {
-                    Adb.shell(this, wifiScript, retry = false)
+            runAndShow {
+                if (!Adb.isConnected(this)) "Not connected. Tap Auto connect at the top." else {
+                    val r = Adb.shell(this, wifiScript, retry = false)
                     Adb.wantConnected = true
-                    "Wi-Fi is going off for 5 seconds. The app reconnects by itself (it checks every 10 seconds)."
+                    if (Adb.failed(r)) r
+                    else "Wi-Fi is going off for 5 seconds. The app reconnects by itself."
                 }
-            }) { show(it) }
+            }
         })
 
         // ---------- Tools page ----------
@@ -388,6 +399,17 @@ class MainActivity : Activity() {
             side(button("Blue") { Mono.saveAccent(this, Mono.BLUE); recreate() }),
             side(button("Purple") { Mono.saveAccent(this, Mono.PURPLE); recreate() })
         ))
+        themePage.addView(label("Safety: risky buttons ask for a second tap"))
+        themePage.addView(row(
+            side(button("Confirm taps: on") {
+                prefs.edit().putBoolean("confirm", true).apply()
+                show("Risky buttons now ask for a second tap.")
+            }),
+            side(button("Confirm taps: off") {
+                prefs.edit().putBoolean("confirm", false).apply()
+                show("Risky buttons now run on the first tap.")
+            })
+        ))
 
         // ---------- put it together ----------
         val content = LinearLayout(this).apply {
@@ -395,7 +417,7 @@ class MainActivity : Activity() {
             setPadding(pad, 0, pad, pad)
             pages.forEach { addView(it) }
         }
-        val scroll = ScrollView(this).apply { addView(content) }
+        val scroll = SteadyScrollView(this, slop).apply { addView(content) }
         val outer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = Mono.screenBackground()
@@ -428,5 +450,38 @@ class MainActivity : Activity() {
 
     private fun refreshStatus() {
         Adb.run({ if (Adb.isConnected(this)) "ADB: connected" else "ADB: not connected" }) { status.text = it }
+    }
+}
+
+/**
+ * A ScrollView that only starts scrolling after a real drag. A shaky controller tap
+ * no longer turns into a scroll, so buttons press the first time.
+ */
+class SteadyScrollView(context: Context, private val slopPx: Int) : ScrollView(context) {
+    private var downX = 0f
+    private var downY = 0f
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            downX = ev.x
+            downY = ev.y
+        } else if (ev.actionMasked == MotionEvent.ACTION_MOVE) {
+            if (Math.abs(ev.x - downX) < slopPx && Math.abs(ev.y - downY) < slopPx) return false
+        }
+        return super.onInterceptTouchEvent(ev)
+    }
+}
+
+/** Same idea for the row of tabs. */
+class SteadyHScrollView(context: Context, private val slopPx: Int) : HorizontalScrollView(context) {
+    private var downX = 0f
+    private var downY = 0f
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            downX = ev.x
+            downY = ev.y
+        } else if (ev.actionMasked == MotionEvent.ACTION_MOVE) {
+            if (Math.abs(ev.x - downX) < slopPx && Math.abs(ev.y - downY) < slopPx) return false
+        }
+        return super.onInterceptTouchEvent(ev)
     }
 }
