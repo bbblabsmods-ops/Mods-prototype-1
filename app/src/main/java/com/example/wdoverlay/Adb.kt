@@ -26,6 +26,7 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
 
 class AdbManager private constructor(context: Context) : AbsAdbConnectionManager() {
 
@@ -73,22 +74,36 @@ class AdbManager private constructor(context: Context) : AbsAdbConnectionManager
 }
 
 object Adb {
-    private val pool = Executors.newSingleThreadExecutor()
+    // Button commands run on a few threads so one slow command never blocks the others.
+    private val commandPool = Executors.newFixedThreadPool(4)
     private val workers = Executors.newCachedThreadPool()
     private val connectLock = Any()
+    private val running = AtomicInteger(0)
 
     /** Set once a connection has worked; the keep-alive then tries to keep it. */
     @Volatile var wantConnected = false
     /** Where the keep-alive reports what it did. */
     @Volatile var onMessage: ((String) -> Unit)? = null
     @Volatile private var watchdogStarted = false
+    @Volatile private var reconnecting = false
+
+    // Facts about the headset that never change, read only once.
+    @Volatile private var cachedModel: String? = null
+    @Volatile private var cachedMaxHz: Int? = null
+    @Volatile private var factsLoaded = false
+    @Volatile private var loadingFacts = false
 
     fun run(block: () -> String, onResult: (String) -> Unit) {
-        pool.execute {
+        commandPool.execute {
             val text = try { block() } catch (t: Throwable) { "Error: ${describe(t)}" }
             android.os.Handler(android.os.Looper.getMainLooper()).post { onResult(text) }
         }
     }
+
+    /** True if a result text means the command did not work. */
+    fun failed(r: String): Boolean =
+        r.startsWith("Not connected") || r.startsWith("Reconnecting") ||
+            r.startsWith("Error") || r.startsWith("Connection lost")
 
     private fun describe(t: Throwable): String {
         val msg = t.message ?: ""
@@ -185,7 +200,7 @@ object Adb {
     }
 
     /** Runs a command on the headset, giving up if it doesn't answer in time. */
-    private fun runShell(m: AdbManager, command: String, timeoutSec: Long = 20): String {
+    private fun runShell(m: AdbManager, command: String, timeoutSec: Long = 12): String {
         val future = workers.submit(Callable<String> {
             val stream = m.openStream("shell:$command")
             stream.openInputStream().bufferedReader().use { it.readText() }.trim().ifEmpty { "(no output)" }
@@ -200,12 +215,9 @@ object Adb {
         }
     }
 
-    /** True only if the headset really answers (not just "looks connected"). */
-    fun isAlive(ctx: Context): Boolean {
-        val m = AdbManager.get(ctx)
-        if (!m.isConnected) return false
-        return try { runShell(m, "echo ok", 4).trim() == "ok" } catch (_: Throwable) { false }
-    }
+    /** True only if the headset really answers. */
+    private fun ping(m: AdbManager, seconds: Long): Boolean =
+        try { runShell(m, "echo ok", seconds).trim() == "ok" } catch (_: Throwable) { false }
 
     fun isConnected(ctx: Context): Boolean = AdbManager.get(ctx).isConnected
 
@@ -240,6 +252,7 @@ object Adb {
             try {
                 if (m.connect(h, port)) {
                     wantConnected = true
+                    warmUp(ctx)
                     return@synchronized "Connected to $h:$port."
                 }
                 reason = "no answer from $h"
@@ -257,27 +270,25 @@ object Adb {
      */
     fun autoConnect(ctx: Context): String = synchronized(connectLock) {
         val m = AdbManager.get(ctx)
-        if (isAlive(ctx)) {
+        fun ok(message: String): String {
             wantConnected = true
-            return@synchronized "Connected (already)."
+            warmUp(ctx)
+            return message
         }
+        if (m.isConnected && ping(m, 6)) return@synchronized ok("Connected (already).")
         dropConnection(m)
         val notes = mutableListOf<String>()
 
         // 1) the ADB library's own search
         try { m.autoConnect(ctx, 10_000L) } catch (t: Throwable) { notes.add(describe(t)) }
-        if (m.isConnected) {
-            wantConnected = true
-            return@synchronized "Connected (found automatically)."
-        }
+        if (m.isConnected) return@synchronized ok("Connected (found automatically).")
 
         // 2) our own search for this headset's Wireless Debugging service
         val found = discoverTls(ctx, 6_000L)
         if (found != null) {
             try {
                 if (m.connect(found.first, found.second)) {
-                    wantConnected = true
-                    return@synchronized "Connected to ${found.first}:${found.second}."
+                    return@synchronized ok("Connected to ${found.first}:${found.second}.")
                 }
             } catch (t: Throwable) {
                 notes.add("${found.first}:${found.second} ${describe(t)}")
@@ -291,10 +302,7 @@ object Adb {
         if (port != null) {
             for (h in listOfNotNull(wifiIp(), "127.0.0.1")) {
                 try {
-                    if (m.connect(h, port)) {
-                        wantConnected = true
-                        return@synchronized "Connected to $h:$port."
-                    }
+                    if (m.connect(h, port)) return@synchronized ok("Connected to $h:$port.")
                 } catch (t: Throwable) {
                     notes.add("$h:$port ${describe(t)}")
                 }
@@ -311,31 +319,65 @@ object Adb {
      */
     fun shell(ctx: Context, command: String, retry: Boolean = true): String {
         val m = AdbManager.get(ctx)
-        if (!m.isConnected) return "Not connected."
-        return try {
-            runShell(m, command)
-        } catch (t: Throwable) {
-            if (!retry) return "Error: ${describe(t)}"
-            val again = autoConnect(ctx)
-            if (!again.startsWith("Connected")) return "Connection lost. $again"
-            try { runShell(m, command) } catch (t2: Throwable) { "Error: ${describe(t2)}" }
+        if (!m.isConnected) {
+            return if (reconnecting) "Reconnecting... try again in a few seconds."
+            else "Not connected. Tap Auto connect at the top."
+        }
+        running.incrementAndGet()
+        try {
+            return try {
+                runShell(m, command)
+            } catch (t: Throwable) {
+                if (!retry) return "Error: ${describe(t)}"
+                val again = autoConnect(ctx)
+                if (!again.startsWith("Connected")) return "Connection lost. $again"
+                try { runShell(m, command) } catch (t2: Throwable) { "Error: ${describe(t2)}" }
+            }
+        } finally {
+            running.decrementAndGet()
+        }
+    }
+
+    // ---------- remembered facts about the headset ----------
+
+    /** Reads the model and the supported refresh rates in a single call. */
+    private fun loadFacts(ctx: Context) {
+        val out = shell(ctx, "getprop ro.product.model; echo @@; dumpsys display | grep -o 'fps=[0-9.]*'")
+        if (failed(out)) return
+        val parts = out.split("@@")
+        val model = parts[0].trim()
+        if (model.isNotEmpty() && model != "(no output)") cachedModel = model
+        if (parts.size > 1) {
+            val hz = Regex("""fps=([0-9]+(?:\.[0-9]+)?)""").findAll(parts[1])
+                .mapNotNull { it.groupValues[1].toDoubleOrNull() }
+                .map { Math.round(it).toInt() }
+                .filter { it in 30..240 }
+                .toList()
+                .maxOrNull()
+            if (hz != null) cachedMaxHz = hz
+        }
+        factsLoaded = true
+    }
+
+    /** Loads the facts in the background right after connecting, so the Max buttons are instant. */
+    private fun warmUp(ctx: Context) {
+        if (factsLoaded || loadingFacts) return
+        loadingFacts = true
+        workers.execute {
+            try { loadFacts(ctx) } catch (_: Throwable) {} finally { loadingFacts = false }
         }
     }
 
     /** The highest refresh rate this headset says it supports, or null if it can't be read. */
     fun maxRefreshRate(ctx: Context): Int? {
-        val out = shell(ctx, "dumpsys display | grep -o 'fps=[0-9.]*'")
-        return Regex("""fps=([0-9]+(?:\.[0-9]+)?)""").findAll(out)
-            .mapNotNull { it.groupValues[1].toDoubleOrNull() }
-            .map { Math.round(it).toInt() }
-            .filter { it in 30..240 }
-            .toList()
-            .maxOrNull()
+        if (cachedMaxHz == null) loadFacts(ctx)
+        return cachedMaxHz
     }
 
     /** The highest CPU level this headset model offers (Quest 2 and Pro: 6, Quest 3 and 3S: 5). */
     fun maxCpuLevel(ctx: Context): Int {
-        val model = shell(ctx, "getprop ro.product.model")
+        if (cachedModel == null) loadFacts(ctx)
+        val model = cachedModel ?: ""
         return if (model.contains("Quest 2", true) || model.contains("Quest Pro", true)) 6 else 5
     }
 
@@ -349,29 +391,41 @@ object Adb {
         return null
     }
 
-    /** Checks the connection every 10 seconds and reconnects by itself if it dropped. */
+    // ---------- keep-alive ----------
+
+    /**
+     * Checks the connection every 8 seconds and reconnects by itself if it really dropped.
+     * It stays out of the way while a command is running, and one slow answer is not
+     * treated as a drop.
+     */
     fun startWatchdog(ctx: Context) {
         if (watchdogStarted) return
         watchdogStarted = true
         val app = ctx.applicationContext
         Thread {
+            var misses = 0
             var failures = 0
             while (true) {
-                try { Thread.sleep(if (failures >= 6) 30_000L else 10_000L) } catch (_: InterruptedException) {}
+                try { Thread.sleep(if (failures >= 6) 30_000L else 8_000L) } catch (_: InterruptedException) {}
                 try {
-                    if (wantConnected) {
-                        val message = autoConnect(app)
-                        if (message == "Connected (already).") {
-                            failures = 0
-                        } else {
-                            if (message.startsWith("Connected")) {
-                                failures = 0
-                                onMessage?.invoke("Reconnected. $message")
-                            } else {
-                                failures++
-                                onMessage?.invoke(message)
-                            }
-                        }
+                    if (!wantConnected || running.get() > 0) continue
+                    val m = AdbManager.get(app)
+                    if (m.isConnected && ping(m, 8)) {
+                        misses = 0
+                        failures = 0
+                        continue
+                    }
+                    misses++
+                    if (m.isConnected && misses < 2) continue
+                    misses = 0
+                    reconnecting = true
+                    val message = try { autoConnect(app) } finally { reconnecting = false }
+                    if (message.startsWith("Connected")) {
+                        failures = 0
+                        onMessage?.invoke("Reconnected. $message")
+                    } else {
+                        failures++
+                        onMessage?.invoke(message)
                     }
                 } catch (_: Throwable) {
                 }
